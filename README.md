@@ -46,3 +46,15 @@ Conv2D：支持动态权重传递，CPU 侧权重存储为 [out_c, in_c, kh, kw]
 MatMul：采用专用的 rknn_matmul_create / rknn_matmul_set_io_mem / rknn_matmul_run API 实现矩阵乘，并封装为通用接口 rknn_matmul_forward(ctx, A, B, C, M, K, N)，方便后续 LLaMA 框架集成。
 
 Softmax/SiLU/LayerNorm：因 RKNN Toolkit 2.3.0 对高维自定义算子的支持有限，将输入展平为二维，使用标准 TensorFlow 算子组合（如 tf.sigmoid、tf.multiply、tf.nn.softmax、手动实现 LayerNorm）生成模型，板端按上述标准流程推理。
+
+5. 测试结果
+已注册 8 个算子，其中 7 个标准算子的 NPU 推理误差均远小于 1% 阈值：
+
+算子	           输入形状	               相对误差     	        备注
+Add	          [1,3,224,224]     	       0.1156%	         双输入逐元素加法
+ReLU	        [1,3,224,224]	             0.0084%	         简单激活函数，精度损失极低
+Conv2D	      [1,224,224,3] (NHWC)	     0.2392%	         包含权重重排与动态权重传递
+MatMul	      [1,64,1,128] × [128,64]	   0.1679%           专用矩阵乘 API，输出为 float32
+Softmax	      [1,12,64]                  0.0663%	         数值稳定性优化
+SiLU	        [1,12,64]	                 0.0771%	         Swish 激活函数
+LayerNorm	    [1,12,64]	                 0.1051%	         无 affine 参数的简化版
