@@ -64,3 +64,31 @@ Softmax	      [1,12,64]                  0.0663%	         数值稳定性优化
 SiLU	        [1,12,64]	                 0.0771%	         Swish 激活函数
 
 LayerNorm	    [1,12,64]	                 0.1051%	         无 affine 参数的简化版
+
+
+三、自定义算子 RoPE 的探索与困境
+1. 目标与初衷
+旋转位置编码（RoPE）是大语言模型 Transformer 架构中的核心组件，但 RK3588 NPU 硬件并不直接支持该算子。根据 RKNN API 参考手册，运行时提供了 rknn_register_custom_ops 接口，允许用户注册自定义算子类型，并在模型推理时由 NPU 调度执行用户编写的 compute 回调函数。本研究希望借此实现 RoPE 的 NPU 框架集成，验证自定义算子机制在 RKNN 生态中的可用性。
+
+2. 已做的工作
+板端自定义算子注册：成功编写 rope_compute 回调函数，并通过 rknn_register_custom_ops 注册为 RoPE 类型，回调函数可被正确调用。
+
+CPU 参考实现：用 C 语言实现了完整的 RoPE 计算，包括 cos/sin 频率表生成与复数旋转公式，计算结果作为精度比较的基准。
+
+多轮模型生成尝试：为将 RoPE 算子部署到 NPU 上，尝试了多种模型构建策略：
+
+四维原始模型：用 TensorFlow 标准算子模拟 RoPE（xcos - xsin 等），输入/输出形状为 [1,128,12,64]（batch×seq_len×num_heads×head_dim）。NPU 输出格式为 NCHW（fmt=0），我们试图通过 NCHW→NHWC 转换匹配 CPU 结果，但布局映射始终错误，平均相对误差约 130%。
+
+二维展平模型：将输入展平为 [1536, 64]，完全消除四维布局歧义。该模型在 NPU 上成功运行，且前 10 个输出值与 CPU 结果高度吻合（仅存在 float16 精度损失），然而从第 12 行开始，误差急剧增大，整体相对误差飙升至 500%～1000%。经多种维度重排假设（8 种）验证，均无法使 NPU 输出与 CPU 一致，排除了布局错位的可能性。
+
+强制 float32 尝试：在生成 RKNN 模型时指定 float_dtype='float32'，希望 NPU 内部采用浮点单精度计算，但工具链实际忽略该配置，输出仍为 float16。
+
+直接调用验证：由于无法生成包含自定义 RoPE 节点的 RKNN 模型，我们在测试程序中绕过模型加载，直接手动构造 rknn_custom_op_tensor 结构体并调用 rope_compute，验证了回调函数本身的正确性。
+
+3. 原因分析
+造成 RoPE 无法在 NPU 上正确运行的根本原因有两个层面：
+
+工具链层：RKNN Toolkit 2.3.0 不支持生成包含自定义算子的 RKNN 模型。其 config() 接口的 custom_string 参数无法声明自定义算子类型，且 rknn.build() 过程中 ONNX Runtime 会对计算图进行完整性校验，遇到未知算子（RoPE）直接报错，无法导出有效模型。
+
+硬件层：当用标准算子（Mul、Add、Sub 等）模拟 RoPE 时，NPU 内部强制以 float16 进行推理。RoPE 涉及幂运算、三角函数以及乘积累，中间结果极易超出 float16 的表示范围（上限约 65504），导致数值溢出，计算结果严重失真。
+
